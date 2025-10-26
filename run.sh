@@ -4,8 +4,8 @@ curl -X POST "https://sambhavg-modal-workspace--tinyzero-rl-web.modal.run/v1/rl/
   "parquet_glob": "/data/data/*.parquet",
   "algo": "grpo",
   "train_args": {
-    "batch_size": 32,
-    "grad_accum": 4,
+    "batch_size": 64,
+    "grad_accum": 16,
     "num_generations": 4,
     "max_prompt_len": 256,
     "max_completion_len": 1024,
@@ -13,7 +13,7 @@ curl -X POST "https://sambhavg-modal-workspace--tinyzero-rl-web.modal.run/v1/rl/
     "num_workers": 8,
     "group_by_length": true,
     "dataloader_pin_memory": true,
-    "warmup_ratio": 0.03,
+    "warmup_ratio": 0.00,
     "lr_scheduler_type": "cosine",
     "max_train_samples": 20000,
     "max_steps": 200,
@@ -23,6 +23,7 @@ curl -X POST "https://sambhavg-modal-workspace--tinyzero-rl-web.modal.run/v1/rl/
     "torch_compile_backend": "inductor",
     "lora_r": 32,
     "lora_alpha": 64,
-    "lora_dropout": 0.05
+    "lora_dropout": 0.05,
+    "beta": 0.2
   }
 }'

@@ -117,7 +117,7 @@ def _now() -> str:
         "/outputs": OUT_VOL,
         "/data": DATA_VOL,
     },
-    timeout=60 * 60,
+    timeout=60 * 60 * 24,
     secrets=[modal.Secret.from_name("wandb-secret")],
 )
 def run_rl_job(
@@ -189,7 +189,7 @@ def run_rl_job(
     df = dfs[[k for k in dfs.keys() if "train" in k][0]]
 
     # Randomize order of rows of df
-    df = df.sample(frac=1).reset_index(drop=True)
+    # df = df.sample(frac=1).reset_index(drop=True)
 
     # Optionally limit dataset size for faster iterations
     max_train_samples = int(train_args.get("max_train_samples", 0) or 0)
@@ -307,101 +307,6 @@ def run_rl_job(
 
     # --- metrics tracking ("aha"/"wait") ---
     step_counter = {"k": 0}
-    seen_correct_once: Dict[int, bool] = {}
-    first_hit_step: Dict[int, int] = {}
-
-    int_pat = re.compile(r"(-?\d+)")
-
-    def extract_final_int(s: str) -> Optional[int]:
-        m = list(int_pat.finditer(s))
-        if not m:
-            return None
-        try:
-            return int(m[-1].group(1))
-        except Exception:
-            return None
-
-    # Reward #1: correctness (1/0 based on final integer)
-    def reward_correctness(completions, ground_truth, **kw):
-        outs = [c[0]["content"] if isinstance(c, list) else str(c) for c in completions]
-        tgts = [
-            gt.get("target") if isinstance(gt, dict) else None for gt in ground_truth
-        ]
-        corr, lengths = [], []
-        for s, tgt in zip(outs, tgts):
-            ans = extract_final_int(s)
-            ok = (
-                1.0
-                if (ans is not None and tgt is not None and ans == int(tgt))
-                else 0.0
-            )
-            corr.append(ok)
-            lengths.append(len(s))
-        # log batch stats
-        step_counter["k"] += 1
-        bstep = step_counter["k"]
-        wandb.log(
-            {
-                "metrics/pct_correct_batch": sum(corr) / max(1, len(corr)),
-                "gen/avg_output_len_chars": sum(lengths) / max(1, len(lengths)),
-                "step": bstep,
-            }
-        )
-        # "aha": first time a prompt becomes correct
-        b = kw.get("batch", {})
-        ids = list(b.get("id_", [])) if isinstance(b, dict) else []
-        aha = 0.0
-        for pid, ok in zip(ids, corr):
-            prior = seen_correct_once.get(pid, False)
-            if (ok == 1.0) and (prior is False):
-                aha += 1.0
-                seen_correct_once[pid] = True
-                if pid not in first_hit_step:
-                    first_hit_step[pid] = bstep
-        if len(ids) > 0:
-            log_data = {"signals/aha_rate": aha / len(ids), "step": bstep}
-            if len(first_hit_step) >= 3:
-                log_data["signals/avg_first_hit_step"] = sum(
-                    first_hit_step.values()
-                ) / len(first_hit_step)
-            wandb.log(log_data)
-
-        # Log up to 10 example generations after each step
-        try:
-            max_rows = 10
-            rows = []
-
-            def _coerce_nums(gt):
-                if not isinstance(gt, dict):
-                    return []
-                nums = (
-                    gt.get("numbers")
-                    if gt.get("numbers") is not None
-                    else gt.get("nums")
-                )
-                if hasattr(nums, "tolist"):
-                    nums = nums.tolist()
-                try:
-                    return list(nums) if nums is not None else []
-                except Exception:
-                    return []
-
-            for j in range(min(max_rows, len(outs))):
-                pid = ids[j] if j < len(ids) else None
-                tgt = None
-                nums = []
-                if j < len(ground_truth) and isinstance(ground_truth[j], dict):
-                    tgt = ground_truth[j].get("target")
-                    nums = _coerce_nums(ground_truth[j])
-                rows.append([pid, tgt, nums, outs[j]])
-            if rows:
-                table = wandb.Table(
-                    columns=["id_", "target", "numbers", "generation"], rows=rows
-                )
-                wandb.log({"samples/generations": table, "step": bstep})
-        except Exception:
-            pass
-        return corr  # primary reward
 
     def extract_solution(solution_str):
         """Extract the equation from the solution string."""
@@ -628,7 +533,7 @@ def run_rl_job(
         dataloader_pin_memory=dataloader_pin_memory,
         warmup_ratio=warmup_ratio,
         lr_scheduler_type=lr_scheduler_type,
-        max_steps=max_steps if max_steps and max_steps > 0 else -1,
+        max_steps=max_steps,
         gradient_checkpointing=True,
     )
     trainer = GRPOTrainer(
