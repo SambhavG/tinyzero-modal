@@ -53,10 +53,14 @@ from rich.pretty import pprint
 
 # ---------- Modal image & volumes ----------
 image = (
-    modal.Image.debian_slim(
-        python_version="3.13"
-    )  # Updated to 3.13 for newer kernel support
-    .apt_install("git")
+    modal.Image.from_registry("nvidia/cuda:13.0.0-devel-ubuntu22.04", add_python="3.13")
+    .apt_install(["python3", "python3-pip", "python3-venv", "git", "wget", "clang"])
+    .env(
+        {
+            "CUDA_HOME": "/usr/local/cuda",
+            "PATH": "/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        }
+    )
     .uv_pip_install(
         # web
         "fastapi==0.112.2",
@@ -66,7 +70,7 @@ image = (
         "datasets>=2.20.0",
         "accelerate>=0.33.0",
         "huggingface_hub[hf_transfer]>=0.24.5",
-        "torch>=2.3.0",
+        "torch==2.9.0",
         "peft>=0.11.1",
         "safetensors>=0.4.3",
         "trl>=0.23.0",
@@ -77,6 +81,11 @@ image = (
         "wandb>=0.17.0",
         "weave",
         "rich",
+        "ninja",
+    )
+    .run_commands(
+        "wget https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.4.18/flash_attn-2.8.3+cu130torch2.9-cp313-cp313-linux_x86_64.whl",
+        "pip install flash_attn-2.8.3+cu130torch2.9-cp313-cp313-linux_x86_64.whl",
     )
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
 )
@@ -178,6 +187,10 @@ def run_rl_job(
     dfs = {p: pd.read_parquet(p) for p in paths}
     # df is the df for which "train" is in the key
     df = dfs[[k for k in dfs.keys() if "train" in k][0]]
+
+    # Randomize order of rows of df
+    df = df.sample(frac=1).reset_index(drop=True)
+
     # Optionally limit dataset size for faster iterations
     max_train_samples = int(train_args.get("max_train_samples", 0) or 0)
     if max_train_samples and len(df) > max_train_samples:
@@ -209,9 +222,8 @@ def run_rl_job(
     tok.pad_token = tok.eos_token
 
     # Enable faster matmul paths on A100 (no accuracy loss for bf16)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.set_float32_matmul_precision("high")
+    torch.backends.cudnn.conv.fp32_precision = "tf32"
+    torch.backends.cuda.matmul.fp32_precision = "ieee"
     torch.backends.cuda.enable_flash_sdp(True)
     torch.backends.cuda.enable_mem_efficient_sdp(True)
 
@@ -229,13 +241,6 @@ def run_rl_job(
         trust_remote_code=True,
         device_map=None,
     )
-    # except Exception:
-    #     # Safe fallback if FlashAttention-2 isn't available
-    #     base = AutoModelForCausalLM.from_pretrained(
-    #         model_name,
-    #         attn_implementation="sdpa",
-    #         **load_kwargs,
-    #     )
 
     # Sync model config with tokenizer to prevent token mismatch warnings
     base.config.pad_token_id = tok.pad_token_id
@@ -286,7 +291,7 @@ def run_rl_job(
     base.config.gradient_checkpointing = True
 
     # Torch compile base model
-    base = torch.compile(base)
+    # base = torch.compile(base)
 
     lora_r = int(train_args.get("lora_r", 32))
     lora_alpha = int(train_args.get("lora_alpha", 64))
@@ -447,9 +452,7 @@ def run_rl_job(
         except Exception as e:
             return None
 
-    def compute_score(
-        solution_str, ground_truth, method="strict", format_score=0.1, score=1.0
-    ):
+    def compute_score(solution_str, ground_truth, format_score=0.1, score=1.0):
         """The scoring function for countdown task.
 
         Args:
@@ -463,44 +466,24 @@ def run_rl_job(
         numbers = ground_truth["numbers"]
 
         equation = extract_solution(solution_str=solution_str)
-        do_print = random.randint(1, 64) == 1
-
-        if do_print:
-            print(f"--------------------------------")
-            print(f"Target: {target} | Numbers: {numbers}")
-            print(f"Extracted equation: {equation}")
-            print(f"Solution string: {solution_str}")
 
         if equation is None:
-            if do_print:
-                print(f"No equation found")
             return 0
 
         # Validate equation uses correct numbers
         if not validate_equation(equation, numbers):
-            if do_print:
-                print(f"Invalid equation")
             return format_score
-
         # Evaluate equation
         try:
             result = evaluate_equation(equation)
             if result is None:
-                if do_print:
-                    print(f"Could not evaluate equation")
                 return format_score
 
             if abs(result - target) < 1e-5:  # Account for floating point precision
-                if do_print:
-                    print(f"Correct equation: {equation} = {result}")
                 return score
             else:
-                if do_print:
-                    print(f"Wrong result: equation = {result}, target = {target}")
                 return format_score
         except Exception:
-            if do_print:
-                print(f"Error evaluating equation")
             return format_score
 
     def compute_score_wrapper(completions, ground_truth, **kw):
@@ -545,66 +528,49 @@ def run_rl_job(
         )
 
         # "aha": first time a prompt becomes fully correct (score == 1.0)
-        b = kw.get("batch", {})
-        ids = list(b.get("id_", [])) if isinstance(b, dict) else []
-        aha = 0.0
-        for pid, sc in zip(ids, scores):
-            prior = seen_correct_once.get(pid, False)
-            if (sc >= 1.0) and (prior is False):
-                aha += 1.0
-                seen_correct_once[pid] = True
-                if pid not in first_hit_step:
-                    first_hit_step[pid] = bstep
-        if len(ids) > 0:
-            log_data = {"signals/aha_rate": aha / len(ids), "step": bstep}
-            if len(first_hit_step) >= 3:
-                log_data["signals/avg_first_hit_step"] = sum(
-                    first_hit_step.values()
-                ) / len(first_hit_step)
-            wandb.log(log_data)
+        # b = kw.get("batch", {})
+        # ids = list(b.get("id_", [])) if isinstance(b, dict) else []
+        # aha = 0.0
+        # for pid, sc in zip(ids, scores):
+        #     prior = seen_correct_once.get(pid, False)
+        #     if (sc >= 1.0) and (prior is False):
+        #         aha += 1.0
+        #         seen_correct_once[pid] = True
+        #         if pid not in first_hit_step:
+        #             first_hit_step[pid] = bstep
+        # if len(ids) > 0:
+        #     log_data = {"signals/aha_rate": aha / len(ids), "step": bstep}
+        #     if len(first_hit_step) >= 3:
+        #         log_data["signals/avg_first_hit_step"] = sum(
+        #             first_hit_step.values()
+        #         ) / len(first_hit_step)
+        #     wandb.log(log_data)
 
-        # Log up to 10 example generations after each step (same schema)
         try:
-            max_rows = 10
-            rows = []
-
-            def _coerce_nums(gt):
-                if not isinstance(gt, dict):
-                    return []
-                nums = (
-                    gt.get("numbers")
-                    if gt.get("numbers") is not None
-                    else gt.get("nums")
-                )
-                if hasattr(nums, "tolist"):
-                    nums = nums.tolist()
-                try:
-                    return list(nums) if nums is not None else []
-                except Exception:
-                    return []
-
-            for j in range(min(max_rows, len(outs))):
-                pid = ids[j] if j < len(ids) else None
-                tgt = None
-                nums = []
-                if j < len(ground_truth) and isinstance(ground_truth[j], dict):
-                    tgt = ground_truth[j].get("target")
-                    nums = _coerce_nums(ground_truth[j])
-                rows.append([pid, tgt, nums, outs[j]])
-            if rows:
-                table = wandb.Table(
-                    columns=["id_", "target", "numbers", "generation"], rows=rows
-                )
-                wandb.log({"samples/generations": table, "step": bstep})
-        except Exception:
+            table = wandb.Table(
+                columns=["id_", "target", "numbers", "generation", "correct", "length"],
+                rows=[
+                    [
+                        ids[j],
+                        ground_truth[j].get("target"),
+                        ground_truth[j].get("numbers"),
+                        outs[j],
+                        scores[j] >= 1.0,
+                        len(outs[j]),
+                    ]
+                    for j in range(len(outs))
+                ],
+            )
+            wandb.log({"samples/generations": table, "step": bstep})
+        except Exception as e:
+            print(f"Error logging generations: {e}")
             pass
 
         return scores
 
-    # Reward #2: brevity shaping (tiny negative for verbosity)
-    def reward_brevity(completions, **kw):
-        outs = [c[0]["content"] if isinstance(c, list) else str(c) for c in completions]
-        return [-0.001 * max(0, len(s)) for s in outs]
+    # def reward_brevity(completions, **kw):
+    #     outs = [c[0]["content"] if isinstance(c, list) else str(c) for c in completions]
+    #     return [-0.001 * max(0, len(s)) for s in outs]
 
     # --- training args & algo switch ---
     rprint("[bold green]Loading training args...[/bold green]")
@@ -612,7 +578,7 @@ def run_rl_job(
     per_device_bs = int(train_args.get("batch_size", 2))
     grad_accum = int(train_args.get("grad_accum", 8))
     lr = float(train_args.get("lr", 1e-6))
-    logging_steps = int(train_args.get("logging_steps", 10))
+    logging_steps = 1
     num_gen = int(train_args.get("num_generations", 4))
     max_prompt_len = int(train_args.get("max_prompt_len", 512))
     max_completion_len = int(train_args.get("max_completion_len", 128))
@@ -670,7 +636,7 @@ def run_rl_job(
         processing_class=tok,  # tokenizer; left padding required
         args=cfg,
         train_dataset=ds,
-        reward_funcs=[compute_score_wrapper, reward_brevity],
+        reward_funcs=[compute_score_wrapper],
         peft_config=lora_cfg,
     )
 
