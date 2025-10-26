@@ -134,6 +134,10 @@ def run_rl_job(
     from trl import GRPOConfig, GRPOTrainer, PPOConfig, PPOTrainer
     import wandb
     import weave
+    import re
+    import random
+    import ast
+    import operator
 
     os.makedirs(OUT_ROOT, exist_ok=True)
 
@@ -185,177 +189,58 @@ def run_rl_job(
     pprint(df.head())
     rprint(f"[bold blue]DF size used:[/bold blue] {len(df)} rows")
 
-    # The parquet schema (as provided) includes:
-    #  target:int, nums:list[int], prompt:(list-of-dicts or JSON str), reward_model:dict, extra_info:dict{index,split}, ...
-    # We'll yield TRL's expected "prompt" column (chat messages) + ground_truth + id_
-    def row_to_prompt(row):
-        pr = row.get("prompt")
-        # Use prompt from parquet directly when present
-        if isinstance(pr, list):
-            return pr
-        # Handle numpy arrays (which may be stored as arrays in parquet)
-        if hasattr(pr, "tolist"):  # numpy array
-            pr_list = pr.tolist()
-            if isinstance(pr_list, list):
-                return pr_list
-        if isinstance(pr, str):
-            try:
-                parsed = json.loads(pr)
-                if isinstance(parsed, list):
-                    return parsed
-                if isinstance(parsed, dict):
-                    return [parsed]
-            except Exception:
-                # It's a plain text prompt; wrap as single user message
-                return [{"role": "user", "content": pr}]
-        # Fallback only if prompt is missing/None
-        try:
-            t = int(row.get("target")) if row.get("target") is not None else 0
-            nums = None
-            if isinstance(row, dict):
-                if "nums" in row and row.get("nums") is not None:
-                    nums = row.get("nums")
-                elif "numbers" in row and row.get("numbers") is not None:
-                    nums = row.get("numbers")
-            if hasattr(nums, "tolist"):
-                nums = nums.tolist()
-            if nums is None:
-                nums = []
-            nums = list(nums)
-        except Exception:
-            t, nums = 0, []
-        txt = (
-            "You are playing Countdown (numbers game).\n"
-            f"Numbers: {nums}\nTarget: {t}\n"
-            "Produce a valid arithmetic expression using only these numbers each at most once.\n"
-            "At the end, output the final integer on a new line as 'Answer: <int>'."
-        )
-        return [{"role": "user", "content": txt}]
-
-    def row_to_ground_truth(row):
-        # Prefer reward_model.ground_truth when available
-        rm = row.get("reward_model")
-        gt = None
-        if isinstance(rm, dict):
-            gt = rm.get("ground_truth")
-        elif isinstance(rm, str):
-            try:
-                rm_parsed = json.loads(rm)
-                if isinstance(rm_parsed, dict):
-                    gt = rm_parsed.get("ground_truth")
-            except Exception:
-                pass
-        target_val = None
-        numbers_val = None
-        if isinstance(gt, dict):
-            target_val = gt.get("target")
-            if "numbers" in gt and gt.get("numbers") is not None:
-                numbers_val = gt.get("numbers")
-            elif "nums" in gt and gt.get("nums") is not None:
-                numbers_val = gt.get("nums")
-        # Fallback to top-level columns if needed
-        if target_val is None:
-            target_val = row.get("target")
-        if numbers_val is None:
-            if "nums" in row and row.get("nums") is not None:
-                numbers_val = row.get("nums")
-            elif "numbers" in row and row.get("numbers") is not None:
-                numbers_val = row.get("numbers")
-        # Coerce types
-        if hasattr(numbers_val, "tolist"):
-            numbers_val = numbers_val.tolist()
-        if numbers_val is None:
-            numbers_val = []
-        try:
-            numbers_val = [int(x) for x in list(numbers_val)]
-        except Exception:
-            numbers_val = []
-        try:
-            target_val = int(target_val) if target_val is not None else None
-        except Exception:
-            target_val = None
-        return {"target": target_val, "numbers": numbers_val}
-
     ids, prompts, gts = [], [], []
     for i, r in df.iterrows():
-        idx = (
-            r.get("extra_info", {}).get("index", i)
-            if isinstance(r.get("extra_info"), dict)
-            else i
-        )
-        ids.append(int(idx))
-        prompts.append(row_to_prompt(r))
-        gts.append(row_to_ground_truth(r))
+        ids.append(r.get("extra_info").get("index"))
+        prompts.append(r.get("prompt"))
+        gts.append(r.get("reward_model").get("ground_truth"))
+
+    print("Prompts: ", len(prompts))
+    print("First prompt: ", prompts[0])
 
     # Converting dict to Dataset
-    rprint("[bold green]Converting dict to Dataset...[/bold green]")
     ds = Dataset.from_dict({"prompt": prompts, "ground_truth": gts, "id_": ids})
 
     # --- model + tokenizer ---
-    rprint("[bold green]Loading tokenizer...[/bold green]")
     tok = AutoTokenizer.from_pretrained(
         model_name, use_fast=True, trust_remote_code=True
     )
-    tok.padding_side = "left"  # TRL expects left padding for decoder-only
-
-    # Configure tokenizer tokens properly for Qwen models
-    # This prevents the "new PAD/BOS/EOS tokens" warning
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token or tok.unk_token
-        # Explicitly set pad_token_id to match
-        if tok.eos_token_id is not None:
-            tok.pad_token_id = tok.eos_token_id
-
-    # Ensure model config is aligned with tokenizer
-    # This is especially important for Qwen models
+    tok.padding_side = "left"
+    tok.pad_token = tok.eos_token
 
     # Enable faster matmul paths on A100 (no accuracy loss for bf16)
-    if torch.cuda.is_available():
-        try:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            torch.set_float32_matmul_precision("high")
-        except Exception:
-            pass
-        # Try enabling flash and mem-efficient SDP kernels if available
-        try:
-            # Available in torch 2.0+
-            torch.backends.cuda.enable_flash_sdp(True)
-            torch.backends.cuda.enable_mem_efficient_sdp(True)
-        except Exception:
-            pass
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
 
-    rprint("[bold green]Loading model...[/bold green]")
-    use_flash_attn = bool(train_args.get("use_flash_attn", False))
-    attn_pref = "flash_attention_2" if use_flash_attn else "sdpa"
-    load_kwargs = dict(
-        dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        low_cpu_mem_usage=True,
+    # load_kwargs = dict(
+    #     dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+    #     low_cpu_mem_usage=True,
+    #     trust_remote_code=True,
+    #     device_map=None,  # Trainer/Accelerate manages placement
+    # )
+    # try:
+    base = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        attn_implementation="flash_attention_2",
+        dtype=torch.bfloat16,
         trust_remote_code=True,
-        device_map=None,  # Trainer/Accelerate manages placement
+        device_map=None,
     )
-    try:
-        base = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            attn_implementation=attn_pref,
-            **load_kwargs,
-        )
-    except Exception:
-        # Safe fallback if FlashAttention-2 isn't available
-        base = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            attn_implementation="sdpa",
-            **load_kwargs,
-        )
+    # except Exception:
+    #     # Safe fallback if FlashAttention-2 isn't available
+    #     base = AutoModelForCausalLM.from_pretrained(
+    #         model_name,
+    #         attn_implementation="sdpa",
+    #         **load_kwargs,
+    #     )
 
     # Sync model config with tokenizer to prevent token mismatch warnings
-    if hasattr(base, "config"):
-        if tok.pad_token_id is not None:
-            base.config.pad_token_id = tok.pad_token_id
-        if tok.bos_token_id is not None:
-            base.config.bos_token_id = tok.bos_token_id
-        if tok.eos_token_id is not None:
-            base.config.eos_token_id = tok.eos_token_id
+    base.config.pad_token_id = tok.pad_token_id
+    base.config.bos_token_id = tok.bos_token_id
+    base.config.eos_token_id = tok.eos_token_id
 
     # --- pick LoRA targets ---
     def guess_lora_targets(model: nn.Module) -> List[str]:
@@ -391,25 +276,18 @@ def run_rl_job(
             leaf_linear_names.add(leaf)
             if (leaf in preferred) or any(k in leaf for k in preferred):
                 preferred_hits.add(leaf)
+        print("[guess_lora_targets] Preferred hits: ", preferred_hits)
+        print("[guess_lora_targets] Leaf linear names: ", leaf_linear_names)
         return sorted(preferred_hits or leaf_linear_names)
 
-    # Gradient checkpointing to reduce memory, speed depends on compute/memory tradeoff
-    if bool(train_args.get("gradient_checkpointing", True)):
-        try:
-            base.gradient_checkpointing_enable()
-        except Exception:
-            pass
-        if hasattr(base, "config"):
-            try:
-                base.config.use_cache = False
-                base.config.gradient_checkpointing = True
-            except Exception:
-                pass
+    # Gradient checkpointing to reduce memory
+    base.gradient_checkpointing_enable()
+    base.config.use_cache = False
+    base.config.gradient_checkpointing = True
 
     # Torch compile base model
     base = torch.compile(base)
 
-    rprint("[bold green]Loading LoRA config...[/bold green]")
     lora_r = int(train_args.get("lora_r", 32))
     lora_alpha = int(train_args.get("lora_alpha", 64))
     lora_dropout = float(train_args.get("lora_dropout", 0.05))
@@ -438,22 +316,13 @@ def run_rl_job(
         except Exception:
             return None
 
-    def time_to_answer_chars(s: str) -> int:
-        # proxy "wait": chars until "Answer:" or first final int line
-        pos = s.find("Answer:")
-        if pos >= 0:
-            return pos
-        # fallback: first number occurrence
-        m = int_pat.search(s)
-        return m.start() if m else len(s)
-
     # Reward #1: correctness (1/0 based on final integer)
     def reward_correctness(completions, ground_truth, **kw):
         outs = [c[0]["content"] if isinstance(c, list) else str(c) for c in completions]
         tgts = [
             gt.get("target") if isinstance(gt, dict) else None for gt in ground_truth
         ]
-        corr, lengths, tta = [], [], []
+        corr, lengths = [], []
         for s, tgt in zip(outs, tgts):
             ans = extract_final_int(s)
             ok = (
@@ -463,7 +332,6 @@ def run_rl_job(
             )
             corr.append(ok)
             lengths.append(len(s))
-            tta.append(time_to_answer_chars(s))
         # log batch stats
         step_counter["k"] += 1
         bstep = step_counter["k"]
@@ -471,7 +339,6 @@ def run_rl_job(
             {
                 "metrics/pct_correct_batch": sum(corr) / max(1, len(corr)),
                 "gen/avg_output_len_chars": sum(lengths) / max(1, len(lengths)),
-                "gen/avg_time_to_answer_chars": sum(tta) / max(1, len(tta)),
                 "step": bstep,
             }
         )
@@ -530,6 +397,209 @@ def run_rl_job(
         except Exception:
             pass
         return corr  # primary reward
+
+    def extract_solution(solution_str):
+        """Extract the equation from the solution string."""
+        # Remove everything before the first "Assistant:"
+        if "Assistant:" in solution_str:
+            solution_str = solution_str.split("Assistant:", 1)[1]
+        elif "<|im_start|>assistant" in solution_str:
+            solution_str = solution_str.split("<|im_start|>assistant", 1)[1]
+        else:
+            return None
+        solution_str = solution_str.split("\n")[-1]
+
+        answer_pattern = r"<answer>(.*?)</answer>"
+        match = re.finditer(answer_pattern, solution_str)
+        matches = list(match)
+        if matches:
+            final_answer = matches[-1].group(1).strip()
+        else:
+            final_answer = None
+        return final_answer
+
+    def validate_equation(equation_str, available_numbers):
+        """Validate that equation only uses available numbers and each number once."""
+        try:
+            # Extract all numbers from the equation
+            numbers_in_eq = [int(n) for n in re.findall(r"\d+", equation_str)]
+
+            # Check if all numbers in equation are available
+            available_numbers = sorted(available_numbers)
+            numbers_in_eq = sorted(numbers_in_eq)
+
+            # Each number should be used exactly once
+            return numbers_in_eq == available_numbers
+        except:
+            return False
+
+    def evaluate_equation(equation_str):
+        """Safely evaluate the arithmetic equation using eval() with precautions."""
+        try:
+            # Define a regex pattern that only allows numbers, operators, parentheses, and whitespace
+            allowed_pattern = r"^[\d+\-*/().\s]+$"
+            if not re.match(allowed_pattern, equation_str):
+                raise ValueError("Invalid characters in equation.")
+
+            # Evaluate the equation with restricted globals and locals
+            result = eval(equation_str, {"__builtins__": None}, {})
+            return result
+        except Exception as e:
+            return None
+
+    def compute_score(
+        solution_str, ground_truth, method="strict", format_score=0.1, score=1.0
+    ):
+        """The scoring function for countdown task.
+
+        Args:
+            solution_str: the solution text
+            ground_truth: dictionary containing target number and available numbers
+            method: the method to extract the solution
+            format_score: the score for correct format but wrong answer
+            score: the score for the correct answer
+        """
+        target = ground_truth["target"]
+        numbers = ground_truth["numbers"]
+
+        equation = extract_solution(solution_str=solution_str)
+        do_print = random.randint(1, 64) == 1
+
+        if do_print:
+            print(f"--------------------------------")
+            print(f"Target: {target} | Numbers: {numbers}")
+            print(f"Extracted equation: {equation}")
+            print(f"Solution string: {solution_str}")
+
+        if equation is None:
+            if do_print:
+                print(f"No equation found")
+            return 0
+
+        # Validate equation uses correct numbers
+        if not validate_equation(equation, numbers):
+            if do_print:
+                print(f"Invalid equation")
+            return format_score
+
+        # Evaluate equation
+        try:
+            result = evaluate_equation(equation)
+            if result is None:
+                if do_print:
+                    print(f"Could not evaluate equation")
+                return format_score
+
+            if abs(result - target) < 1e-5:  # Account for floating point precision
+                if do_print:
+                    print(f"Correct equation: {equation} = {result}")
+                return score
+            else:
+                if do_print:
+                    print(f"Wrong result: equation = {result}, target = {target}")
+                return format_score
+        except Exception:
+            if do_print:
+                print(f"Error evaluating equation")
+            return format_score
+
+    def compute_score_wrapper(completions, ground_truth, **kw):
+        outs = [c[0]["content"] if isinstance(c, list) else str(c) for c in completions]
+        # Compute per-sample scores using the new compute_score while preserving logging
+        scores, lengths = [], []
+        for s, gt in zip(outs, ground_truth):
+            gt_dict = gt if isinstance(gt, dict) else {}
+            # Normalize numbers key for compatibility (dataset may use "nums")
+            if (
+                isinstance(gt_dict, dict)
+                and ("numbers" not in gt_dict)
+                and ("nums" in gt_dict)
+            ):
+                try:
+                    tmp = dict(gt_dict)
+                    tmp["numbers"] = (
+                        tmp.get("numbers")
+                        if tmp.get("numbers") is not None
+                        else tmp.get("nums")
+                    )
+                    gt_dict = tmp
+                except Exception:
+                    pass
+            try:
+                sc = float(compute_score(s, gt_dict))
+            except Exception:
+                sc = 0.0
+            scores.append(sc)
+            lengths.append(len(s))
+
+        # log batch stats (keep names stable with prior runs)
+        step_counter["k"] += 1
+        bstep = step_counter["k"]
+        pct_correct = sum(1.0 for sc in scores if sc >= 1.0) / max(1, len(scores))
+        wandb.log(
+            {
+                "metrics/pct_correct_batch": pct_correct,
+                "gen/avg_output_len_chars": sum(lengths) / max(1, len(lengths)),
+                "step": bstep,
+            }
+        )
+
+        # "aha": first time a prompt becomes fully correct (score == 1.0)
+        b = kw.get("batch", {})
+        ids = list(b.get("id_", [])) if isinstance(b, dict) else []
+        aha = 0.0
+        for pid, sc in zip(ids, scores):
+            prior = seen_correct_once.get(pid, False)
+            if (sc >= 1.0) and (prior is False):
+                aha += 1.0
+                seen_correct_once[pid] = True
+                if pid not in first_hit_step:
+                    first_hit_step[pid] = bstep
+        if len(ids) > 0:
+            log_data = {"signals/aha_rate": aha / len(ids), "step": bstep}
+            if len(first_hit_step) >= 3:
+                log_data["signals/avg_first_hit_step"] = sum(
+                    first_hit_step.values()
+                ) / len(first_hit_step)
+            wandb.log(log_data)
+
+        # Log up to 10 example generations after each step (same schema)
+        try:
+            max_rows = 10
+            rows = []
+
+            def _coerce_nums(gt):
+                if not isinstance(gt, dict):
+                    return []
+                nums = (
+                    gt.get("numbers")
+                    if gt.get("numbers") is not None
+                    else gt.get("nums")
+                )
+                if hasattr(nums, "tolist"):
+                    nums = nums.tolist()
+                try:
+                    return list(nums) if nums is not None else []
+                except Exception:
+                    return []
+
+            for j in range(min(max_rows, len(outs))):
+                pid = ids[j] if j < len(ids) else None
+                tgt = None
+                nums = []
+                if j < len(ground_truth) and isinstance(ground_truth[j], dict):
+                    tgt = ground_truth[j].get("target")
+                    nums = _coerce_nums(ground_truth[j])
+                rows.append([pid, tgt, nums, outs[j]])
+            if rows:
+                table = wandb.Table(
+                    columns=["id_", "target", "numbers", "generation"], rows=rows
+                )
+                wandb.log({"samples/generations": table, "step": bstep})
+        except Exception:
+            pass
+
+        return scores
 
     # Reward #2: brevity shaping (tiny negative for verbosity)
     def reward_brevity(completions, **kw):
@@ -600,7 +670,7 @@ def run_rl_job(
         processing_class=tok,  # tokenizer; left padding required
         args=cfg,
         train_dataset=ds,
-        reward_funcs=[reward_correctness, reward_brevity],
+        reward_funcs=[compute_score_wrapper, reward_brevity],
         peft_config=lora_cfg,
     )
 
