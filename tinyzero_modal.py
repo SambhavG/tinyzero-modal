@@ -47,12 +47,15 @@
 import os, re, io, json, time, uuid, glob, tarfile, asyncio, fnmatch
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-import weave
 import modal
+from rich import print as rprint
+from rich.pretty import pprint
 
 # ---------- Modal image & volumes ----------
 image = (
-    modal.Image.debian_slim(python_version="3.12")
+    modal.Image.debian_slim(
+        python_version="3.13"
+    )  # Updated to 3.13 for newer kernel support
     .apt_install("git")
     .uv_pip_install(
         # web
@@ -73,6 +76,7 @@ image = (
         "scipy>=1.13.1",
         "wandb>=0.17.0",
         "weave",
+        "rich",
     )
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
 )
@@ -98,7 +102,7 @@ def _now() -> str:
 # ============================================================
 @app.function(
     image=image,
-    gpu="A100-80GB:2",  # two A100-80GB GPUs
+    gpu="B200",
     volumes={
         "/root/.cache/huggingface": HF_VOL,
         "/outputs": OUT_VOL,
@@ -129,6 +133,7 @@ def run_rl_job(
     from peft import LoraConfig
     from trl import GRPOConfig, GRPOTrainer, PPOConfig, PPOTrainer
     import wandb
+    import weave
 
     os.makedirs(OUT_ROOT, exist_ok=True)
 
@@ -160,21 +165,65 @@ def run_rl_job(
     except Exception:
         # Safe to proceed; initial mount already contains a snapshot
         pass
-
+    rprint("[bold green]Parquet glob:[/bold green]")
+    pprint(parquet_glob)
     paths = sorted(glob.glob(parquet_glob))
-    dfs = [pd.read_parquet(p) for p in paths]
-    df = pd.concat(dfs, ignore_index=True)
+    rprint("[bold green]Paths:[/bold green]")
+    pprint(paths)
+    # dict from path to df
+    dfs = {p: pd.read_parquet(p) for p in paths}
+    # df is the df for which "train" is in the key
+    df = dfs[[k for k in dfs.keys() if "train" in k][0]]
+    # Optionally limit dataset size for faster iterations
+    max_train_samples = int(train_args.get("max_train_samples", 0) or 0)
+    if max_train_samples and len(df) > max_train_samples:
+        seed_val = int(train_args.get("shuffle_seed", 42))
+        df = df.sample(n=max_train_samples, random_state=seed_val).reset_index(
+            drop=True
+        )
+    rprint("[bold blue]DF head:[/bold blue]")
+    pprint(df.head())
+    rprint(f"[bold blue]DF size used:[/bold blue] {len(df)} rows")
 
     # The parquet schema (as provided) includes:
-    #  target:int, nums:list[int], prompt:(list-of-dicts or str), reward_model:dict, extra_info:dict{index,split}, ...
-    # We'll yield TRL's expected "prompt" column (conversational messages) + ground_truth + id_
+    #  target:int, nums:list[int], prompt:(list-of-dicts or JSON str), reward_model:dict, extra_info:dict{index,split}, ...
+    # We'll yield TRL's expected "prompt" column (chat messages) + ground_truth + id_
     def row_to_prompt(row):
         pr = row.get("prompt")
-        if isinstance(pr, list):  # already [{"role":..., "content":...}, ...]
+        # Use prompt from parquet directly when present
+        if isinstance(pr, list):
             return pr
-        # fallback: construct a clear Countdown instruction with format
-        t = int(row["target"])
-        nums = list(row["nums"])
+        # Handle numpy arrays (which may be stored as arrays in parquet)
+        if hasattr(pr, "tolist"):  # numpy array
+            pr_list = pr.tolist()
+            if isinstance(pr_list, list):
+                return pr_list
+        if isinstance(pr, str):
+            try:
+                parsed = json.loads(pr)
+                if isinstance(parsed, list):
+                    return parsed
+                if isinstance(parsed, dict):
+                    return [parsed]
+            except Exception:
+                # It's a plain text prompt; wrap as single user message
+                return [{"role": "user", "content": pr}]
+        # Fallback only if prompt is missing/None
+        try:
+            t = int(row.get("target")) if row.get("target") is not None else 0
+            nums = None
+            if isinstance(row, dict):
+                if "nums" in row and row.get("nums") is not None:
+                    nums = row.get("nums")
+                elif "numbers" in row and row.get("numbers") is not None:
+                    nums = row.get("numbers")
+            if hasattr(nums, "tolist"):
+                nums = nums.tolist()
+            if nums is None:
+                nums = []
+            nums = list(nums)
+        except Exception:
+            t, nums = 0, []
         txt = (
             "You are playing Countdown (numbers game).\n"
             f"Numbers: {nums}\nTarget: {t}\n"
@@ -182,6 +231,50 @@ def run_rl_job(
             "At the end, output the final integer on a new line as 'Answer: <int>'."
         )
         return [{"role": "user", "content": txt}]
+
+    def row_to_ground_truth(row):
+        # Prefer reward_model.ground_truth when available
+        rm = row.get("reward_model")
+        gt = None
+        if isinstance(rm, dict):
+            gt = rm.get("ground_truth")
+        elif isinstance(rm, str):
+            try:
+                rm_parsed = json.loads(rm)
+                if isinstance(rm_parsed, dict):
+                    gt = rm_parsed.get("ground_truth")
+            except Exception:
+                pass
+        target_val = None
+        numbers_val = None
+        if isinstance(gt, dict):
+            target_val = gt.get("target")
+            if "numbers" in gt and gt.get("numbers") is not None:
+                numbers_val = gt.get("numbers")
+            elif "nums" in gt and gt.get("nums") is not None:
+                numbers_val = gt.get("nums")
+        # Fallback to top-level columns if needed
+        if target_val is None:
+            target_val = row.get("target")
+        if numbers_val is None:
+            if "nums" in row and row.get("nums") is not None:
+                numbers_val = row.get("nums")
+            elif "numbers" in row and row.get("numbers") is not None:
+                numbers_val = row.get("numbers")
+        # Coerce types
+        if hasattr(numbers_val, "tolist"):
+            numbers_val = numbers_val.tolist()
+        if numbers_val is None:
+            numbers_val = []
+        try:
+            numbers_val = [int(x) for x in list(numbers_val)]
+        except Exception:
+            numbers_val = []
+        try:
+            target_val = int(target_val) if target_val is not None else None
+        except Exception:
+            target_val = None
+        return {"target": target_val, "numbers": numbers_val}
 
     ids, prompts, gts = [], [], []
     for i, r in df.iterrows():
@@ -192,25 +285,77 @@ def run_rl_job(
         )
         ids.append(int(idx))
         prompts.append(row_to_prompt(r))
-        gts.append({"target": int(r["target"]), "nums": list(r["nums"])})
+        gts.append(row_to_ground_truth(r))
 
+    # Converting dict to Dataset
+    rprint("[bold green]Converting dict to Dataset...[/bold green]")
     ds = Dataset.from_dict({"prompt": prompts, "ground_truth": gts, "id_": ids})
 
     # --- model + tokenizer ---
+    rprint("[bold green]Loading tokenizer...[/bold green]")
     tok = AutoTokenizer.from_pretrained(
         model_name, use_fast=True, trust_remote_code=True
     )
     tok.padding_side = "left"  # TRL expects left padding for decoder-only
+
+    # Configure tokenizer tokens properly for Qwen models
+    # This prevents the "new PAD/BOS/EOS tokens" warning
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token or tok.unk_token
+        # Explicitly set pad_token_id to match
+        if tok.eos_token_id is not None:
+            tok.pad_token_id = tok.eos_token_id
 
-    base = AutoModelForCausalLM.from_pretrained(
-        model_name,
+    # Ensure model config is aligned with tokenizer
+    # This is especially important for Qwen models
+
+    # Enable faster matmul paths on A100 (no accuracy loss for bf16)
+    if torch.cuda.is_available():
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+        # Try enabling flash and mem-efficient SDP kernels if available
+        try:
+            # Available in torch 2.0+
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+        except Exception:
+            pass
+
+    rprint("[bold green]Loading model...[/bold green]")
+    use_flash_attn = bool(train_args.get("use_flash_attn", False))
+    attn_pref = "flash_attention_2" if use_flash_attn else "sdpa"
+    load_kwargs = dict(
         dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
         low_cpu_mem_usage=True,
         trust_remote_code=True,
         device_map=None,  # Trainer/Accelerate manages placement
     )
+    try:
+        base = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            attn_implementation=attn_pref,
+            **load_kwargs,
+        )
+    except Exception:
+        # Safe fallback if FlashAttention-2 isn't available
+        base = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            attn_implementation="sdpa",
+            **load_kwargs,
+        )
+
+    # Sync model config with tokenizer to prevent token mismatch warnings
+    if hasattr(base, "config"):
+        if tok.pad_token_id is not None:
+            base.config.pad_token_id = tok.pad_token_id
+        if tok.bos_token_id is not None:
+            base.config.bos_token_id = tok.bos_token_id
+        if tok.eos_token_id is not None:
+            base.config.eos_token_id = tok.eos_token_id
 
     # --- pick LoRA targets ---
     def guess_lora_targets(model: nn.Module) -> List[str]:
@@ -248,10 +393,30 @@ def run_rl_job(
                 preferred_hits.add(leaf)
         return sorted(preferred_hits or leaf_linear_names)
 
+    # Gradient checkpointing to reduce memory, speed depends on compute/memory tradeoff
+    if bool(train_args.get("gradient_checkpointing", True)):
+        try:
+            base.gradient_checkpointing_enable()
+        except Exception:
+            pass
+        if hasattr(base, "config"):
+            try:
+                base.config.use_cache = False
+                base.config.gradient_checkpointing = True
+            except Exception:
+                pass
+
+    # Torch compile base model
+    base = torch.compile(base)
+
+    rprint("[bold green]Loading LoRA config...[/bold green]")
+    lora_r = int(train_args.get("lora_r", 32))
+    lora_alpha = int(train_args.get("lora_alpha", 64))
+    lora_dropout = float(train_args.get("lora_dropout", 0.05))
     lora_cfg = LoraConfig(
-        r=64,
-        lora_alpha=128,
-        lora_dropout=0.05,
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
         target_modules=guess_lora_targets(base),
@@ -328,6 +493,42 @@ def run_rl_job(
                     first_hit_step.values()
                 ) / len(first_hit_step)
             wandb.log(log_data)
+
+        # Log up to 10 example generations after each step
+        try:
+            max_rows = 10
+            rows = []
+
+            def _coerce_nums(gt):
+                if not isinstance(gt, dict):
+                    return []
+                nums = (
+                    gt.get("numbers")
+                    if gt.get("numbers") is not None
+                    else gt.get("nums")
+                )
+                if hasattr(nums, "tolist"):
+                    nums = nums.tolist()
+                try:
+                    return list(nums) if nums is not None else []
+                except Exception:
+                    return []
+
+            for j in range(min(max_rows, len(outs))):
+                pid = ids[j] if j < len(ids) else None
+                tgt = None
+                nums = []
+                if j < len(ground_truth) and isinstance(ground_truth[j], dict):
+                    tgt = ground_truth[j].get("target")
+                    nums = _coerce_nums(ground_truth[j])
+                rows.append([pid, tgt, nums, outs[j]])
+            if rows:
+                table = wandb.Table(
+                    columns=["id_", "target", "numbers", "generation"], rows=rows
+                )
+                wandb.log({"samples/generations": table, "step": bstep})
+        except Exception:
+            pass
         return corr  # primary reward
 
     # Reward #2: brevity shaping (tiny negative for verbosity)
@@ -336,19 +537,27 @@ def run_rl_job(
         return [-0.001 * max(0, len(s)) for s in outs]
 
     # --- training args & algo switch ---
+    rprint("[bold green]Loading training args...[/bold green]")
     epochs = float(train_args.get("epochs", 1.0))
     per_device_bs = int(train_args.get("batch_size", 2))
     grad_accum = int(train_args.get("grad_accum", 8))
     lr = float(train_args.get("lr", 1e-6))
     logging_steps = int(train_args.get("logging_steps", 10))
-    num_gen = int(train_args.get("num_generations", 8))
+    num_gen = int(train_args.get("num_generations", 4))
     max_prompt_len = int(train_args.get("max_prompt_len", 512))
-    max_completion_len = int(train_args.get("max_completion_len", 256))
+    max_completion_len = int(train_args.get("max_completion_len", 128))
     loss_type = str(train_args.get("loss_type", "dapo"))  # "dapo" recommended
     scale_rewards = train_args.get(
         "scale_rewards", "group"
     )  # "group"|"batch"|"none"/False
     beta = float(train_args.get("beta", 0.0))  # set >0.0 to log KL
+    optim = str(train_args.get("optim", "adamw_torch_fused"))
+    num_workers = int(train_args.get("num_workers", 4))
+    group_by_length = bool(train_args.get("group_by_length", True))
+    dataloader_pin_memory = bool(train_args.get("dataloader_pin_memory", True))
+    warmup_ratio = float(train_args.get("warmup_ratio", 0.04))
+    lr_scheduler_type = str(train_args.get("lr_scheduler_type", "cosine"))
+    max_steps = int(train_args.get("max_steps", -1))
 
     # Accelerator hints (DDP etc.). For true multi-GPU DDP, launch with accelerate/torchrun.
     accelerator_config = {
@@ -356,67 +565,47 @@ def run_rl_job(
     }
 
     trainer = None
-    if algo.lower() == "grpo":
-        cfg = GRPOConfig(
-            output_dir=out_dir,
-            logging_dir=tb_dir,
-            run_name=run_name,
-            report_to=["wandb"],
-            num_train_epochs=epochs,
-            per_device_train_batch_size=per_device_bs,
-            gradient_accumulation_steps=grad_accum,
-            learning_rate=lr,
-            logging_steps=logging_steps,
-            remove_unused_columns=False,
-            bf16=torch.cuda.is_available(),
-            fp16=False,
-            max_prompt_length=max_prompt_len,
-            max_completion_length=max_completion_len,
-            num_generations=num_gen,
-            loss_type=loss_type,  # "dapo" or "dr_grpo" etc.
-            scale_rewards=scale_rewards,  # "group"|"batch"|"none"/False
-            beta=beta,  # nonzero -> logs KL
-            mask_truncated_completions=True,  # generally stabilizes training
-            accelerator_config=accelerator_config,
-        )
-        trainer = GRPOTrainer(
-            model=base,
-            processing_class=tok,  # tokenizer; left padding required
-            args=cfg,
-            train_dataset=ds,
-            reward_funcs=[reward_correctness, reward_brevity],
-            peft_config=lora_cfg,
-        )
-    else:
-        cfg = PPOConfig(
-            output_dir=out_dir,
-            logging_dir=tb_dir,
-            run_name=run_name,
-            report_to=["wandb"],
-            learning_rate=lr,
-            num_train_epochs=epochs,
-            gradient_accumulation_steps=grad_accum,
-            logging_steps=logging_steps,
-            remove_unused_columns=False,
-            bf16=torch.cuda.is_available(),
-            accelerator_config=accelerator_config,
-        )
-        trainer = PPOTrainer(
-            model=base,
-            processing_class=tok,
-            args=cfg,
-            train_dataset=ds.remove_columns(
-                [
-                    c
-                    for c in ds.column_names
-                    if c not in ["prompt", "ground_truth", "id_"]
-                ]
-            ),
-            reward_funcs=[reward_correctness, reward_brevity],
-            peft_config=lora_cfg,
-        )
+    cfg = GRPOConfig(
+        output_dir=out_dir,
+        logging_dir=tb_dir,
+        run_name=run_name,
+        report_to=["wandb"],
+        num_train_epochs=epochs,
+        per_device_train_batch_size=per_device_bs,
+        gradient_accumulation_steps=grad_accum,
+        learning_rate=lr,
+        logging_steps=logging_steps,
+        remove_unused_columns=False,
+        bf16=torch.cuda.is_available(),
+        fp16=False,
+        max_prompt_length=max_prompt_len,
+        max_completion_length=max_completion_len,
+        num_generations=num_gen,
+        loss_type=loss_type,  # "dapo" or "dr_grpo" etc.
+        scale_rewards=scale_rewards,  # "group"|"batch"|"none"/False
+        beta=beta,  # nonzero -> logs KL
+        mask_truncated_completions=True,  # generally stabilizes training
+        accelerator_config=accelerator_config,
+        optim=optim,
+        dataloader_num_workers=num_workers,
+        group_by_length=group_by_length,
+        dataloader_pin_memory=dataloader_pin_memory,
+        warmup_ratio=warmup_ratio,
+        lr_scheduler_type=lr_scheduler_type,
+        max_steps=max_steps if max_steps and max_steps > 0 else -1,
+        gradient_checkpointing=True,
+    )
+    trainer = GRPOTrainer(
+        model=base,
+        processing_class=tok,  # tokenizer; left padding required
+        args=cfg,
+        train_dataset=ds,
+        reward_funcs=[reward_correctness, reward_brevity],
+        peft_config=lora_cfg,
+    )
 
     # Train!
+    rprint("[bold green]Training...[/bold green]")
     trainer.train()
 
     # save adapter + tokenizer

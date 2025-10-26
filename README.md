@@ -1,0 +1,1 @@
+modal deploy tinyzero_modal.py && ./run.sh
