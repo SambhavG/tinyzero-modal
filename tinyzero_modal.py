@@ -1,6 +1,6 @@
 # tinyzero_modal.py
 # A minimal, clean TinyZero-style RL runner for Countdown on Modal.
-# - GRPO (default) or PPO via "algo" switch
+# - GRPO via VERL
 # - Qwen2.5 3B (non-reasoning), LoRA
 # - Two A100-80GB GPUs
 # - Weights & Biases logging + a tiny live dashboard
@@ -40,40 +40,31 @@
 #   - Weights & Biases:  https://wandb.ai/[your-username]/tinyzero-rl  (run "tinyzero-<job_id>")
 #
 # Notes:
-# - This function requests 2x A100-80GB. TRL uses 🤗 Accelerate under the hood.
-#   For true multi-GPU DDP scaling, launch distributed (accelerate/torchrun).
-#   The setup here emphasizes simplicity and logging to reproduce the “aha” curve.
+# - This function requests 2x A100-80GB. VERL uses Hydra-based configs and supports
+#   distributed training via torchrun. The setup here emphasizes simplicity and
+#   logging to reproduce the “aha” curve.
 
-import os, re, io, json, time, uuid, glob, tarfile, asyncio, fnmatch
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+import os, json, time, uuid, glob, tarfile
+from typing import Any, Dict
 import modal
 from rich import print as rprint
 from rich.pretty import pprint
 
 # ---------- Modal image & volumes ----------
 image = (
-    modal.Image.from_registry("nvidia/cuda:13.0.0-devel-ubuntu22.04", add_python="3.13")
-    .apt_install(["python3", "python3-pip", "python3-venv", "git", "wget", "clang"])
-    .env(
-        {
-            "CUDA_HOME": "/usr/local/cuda",
-            "PATH": "/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        }
-    )
+    modal.Image.from_registry("verlai/verl:app-verl0.4-vllm0.8.5-mcore0.12.1")
+    .apt_install(["git"])  # base image already has CUDA/PyTorch stack
     .uv_pip_install(
-        # web
-        "fastapi==0.112.2",
+        # Web/API
+        "fastapi>=0.112.2",
         "uvicorn==0.30.6",
-        # hf/rl stack
+        # HF stack (present in base but ensure versions)
         "transformers>=4.43.0",
-        "datasets>=2.20.0",
+        "datasets>=4.0.0",
         "accelerate>=0.33.0",
         "huggingface_hub[hf_transfer]>=0.24.5",
-        "torch==2.9.0",
-        "peft>=0.11.1",
-        "safetensors>=0.4.3",
-        "trl>=0.23.0",
+        # VERL + vLLM (pin as per docs)
+        "verl[vllm]==0.4.1",
         # data + metrics
         "pandas>=2.2.2",
         "pyarrow>=16.1.0",
@@ -81,11 +72,6 @@ image = (
         "wandb>=0.17.0",
         "weave",
         "rich",
-        "ninja",
-    )
-    .run_commands(
-        "wget https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.4.18/flash_attn-2.8.3+cu130torch2.9-cp313-cp313-linux_x86_64.whl",
-        "pip install flash_attn-2.8.3+cu130torch2.9-cp313-cp313-linux_x86_64.whl",
     )
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
 )
@@ -111,13 +97,14 @@ def _now() -> str:
 # ============================================================
 @app.function(
     image=image,
-    gpu="B200",
+    gpu="H200",
     volumes={
         "/root/.cache/huggingface": HF_VOL,
         "/outputs": OUT_VOL,
         "/data": DATA_VOL,
     },
     timeout=60 * 60 * 24,
+    scaledown_window=5,
     secrets=[modal.Secret.from_name("wandb-secret")],
 )
 def run_rl_job(
@@ -128,25 +115,13 @@ def run_rl_job(
     train_args: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
-    Launched by the API server; performs RL (GRPO or PPO) and writes:
+    Launched by the API server; performs RL via VERL (GRPO) and writes:
       - Weights & Biases logging to project "tinyzero-rl" with run "tinyzero-<job_id>"
-      - PEFT adapter + tokenizer under /outputs/artifacts/<job_id>
+      - Console logs captured under /outputs/artifacts/<job_id>/verl_demo.log
       - Tarball of artifacts under /outputs/artifacts/<job_id>.tar.gz
     """
-    import math
-    import pandas as pd
-    import torch
-    import torch.nn as nn
-    from datasets import Dataset
-    from transformers import AutoTokenizer, AutoModelForCausalLM
-    from peft import LoraConfig
-    from trl import GRPOConfig, GRPOTrainer, PPOConfig, PPOTrainer
+    import subprocess
     import wandb
-    import weave
-    import re
-    import random
-    import ast
-    import operator
 
     os.makedirs(OUT_ROOT, exist_ok=True)
 
@@ -171,387 +146,97 @@ def run_rl_job(
         config={"job_id": job_id, "model_name": model_name, "algo": algo, **train_args},
     )
 
-    # --- dataset: load Countdown parquet(s) from Modal volume mount at /data ---
-    # Ensure we see the latest committed snapshot of the dataset volume
+    # --- dataset visibility from Modal volume mount at /data ---
     try:
         DATA_VOL.reload()
     except Exception:
-        # Safe to proceed; initial mount already contains a snapshot
         pass
     rprint("[bold green]Parquet glob:[/bold green]")
     pprint(parquet_glob)
     paths = sorted(glob.glob(parquet_glob))
     rprint("[bold green]Paths:[/bold green]")
     pprint(paths)
-    # dict from path to df
-    dfs = {p: pd.read_parquet(p) for p in paths}
-    # df is the df for which "train" is in the key
-    df = dfs[[k for k in dfs.keys() if "train" in k][0]]
 
-    # Randomize order of rows of df
-    # df = df.sample(frac=1).reset_index(drop=True)
+    # Verify presence of train/val
+    has_train = any("train" in p for p in paths)
+    has_val = any(("test" in p) or ("val" in p) for p in paths)
+    if not has_train:
+        raise FileNotFoundError("No train parquet found in provided glob")
+    if not has_val:
+        raise FileNotFoundError("No test/val parquet found in provided glob")
 
-    # Optionally limit dataset size for faster iterations
-    max_train_samples = int(train_args.get("max_train_samples", 0) or 0)
-    if max_train_samples and len(df) > max_train_samples:
-        seed_val = int(train_args.get("shuffle_seed", 42))
-        df = df.sample(n=max_train_samples, random_state=seed_val).reset_index(
-            drop=True
-        )
-    rprint("[bold blue]DF head:[/bold blue]")
-    pprint(df.head())
-    rprint(f"[bold blue]DF size used:[/bold blue] {len(df)} rows")
+    # --- map args and invoke VERL GRPO ---
+    train_file = next(p for p in paths if "train" in p)
+    val_file = next(p for p in paths if ("test" in p) or ("val" in p))
 
-    ids, prompts, gts = [], [], []
-    for i, r in df.iterrows():
-        ids.append(r.get("extra_info").get("index"))
-        prompts.append(r.get("prompt"))
-        gts.append(r.get("reward_model").get("ground_truth"))
-
-    print("Prompts: ", len(prompts))
-    print("First prompt: ", prompts[0])
-
-    # Converting dict to Dataset
-    ds = Dataset.from_dict({"prompt": prompts, "ground_truth": gts, "id_": ids})
-
-    # --- model + tokenizer ---
-    tok = AutoTokenizer.from_pretrained(
-        model_name, use_fast=True, trust_remote_code=True
-    )
-    tok.padding_side = "left"
-    tok.pad_token = tok.eos_token
-
-    # Enable faster matmul paths on A100 (no accuracy loss for bf16)
-    torch.backends.cudnn.conv.fp32_precision = "tf32"
-    torch.backends.cuda.matmul.fp32_precision = "ieee"
-    torch.backends.cuda.enable_flash_sdp(True)
-    torch.backends.cuda.enable_mem_efficient_sdp(True)
-
-    # load_kwargs = dict(
-    #     dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-    #     low_cpu_mem_usage=True,
-    #     trust_remote_code=True,
-    #     device_map=None,  # Trainer/Accelerate manages placement
-    # )
-    # try:
-    base = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        attn_implementation="flash_attention_2",
-        dtype=torch.bfloat16,
-        trust_remote_code=True,
-        device_map=None,
-    )
-
-    # Sync model config with tokenizer to prevent token mismatch warnings
-    base.config.pad_token_id = tok.pad_token_id
-    base.config.bos_token_id = tok.bos_token_id
-    base.config.eos_token_id = tok.eos_token_id
-
-    # --- pick LoRA targets ---
-    def guess_lora_targets(model: nn.Module) -> List[str]:
-        preferred = {
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-            "c_attn",
-            "c_proj",
-            "out_proj",
-            "fc_in",
-            "fc_out",
-            "Wqkv",
-            "Wq",
-            "Wk",
-            "Wv",
-            "Wo",
-            "Wup",
-            "Wdown",
-        }
-        leaf_linear_names, preferred_hits = set(), set()
-        linear_like = (nn.Linear,)
-        linear_like_names = {"Linear8bitLt", "Linear4bit"}
-        for name, module in model.named_modules():
-            leaf = name.split(".")[-1]
-            cls = module.__class__.__name__
-            if not (isinstance(module, linear_like) or cls in linear_like_names):
-                continue
-            leaf_linear_names.add(leaf)
-            if (leaf in preferred) or any(k in leaf for k in preferred):
-                preferred_hits.add(leaf)
-        print("[guess_lora_targets] Preferred hits: ", preferred_hits)
-        print("[guess_lora_targets] Leaf linear names: ", leaf_linear_names)
-        return sorted(preferred_hits or leaf_linear_names)
-
-    # Gradient checkpointing to reduce memory
-    base.gradient_checkpointing_enable()
-    base.config.use_cache = False
-    base.config.gradient_checkpointing = True
-
-    # Torch compile base model
-    # base = torch.compile(base)
-
-    lora_r = int(train_args.get("lora_r", 32))
-    lora_alpha = int(train_args.get("lora_alpha", 64))
-    lora_dropout = float(train_args.get("lora_dropout", 0.05))
-    lora_cfg = LoraConfig(
-        r=lora_r,
-        lora_alpha=lora_alpha,
-        lora_dropout=lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=guess_lora_targets(base),
-    )
-
-    # --- metrics tracking ("aha"/"wait") ---
-    step_counter = {"k": 0}
-
-    def extract_solution(solution_str):
-        """Extract the equation from the solution string."""
-        # Remove everything before the first "Assistant:"
-        if "Assistant:" in solution_str:
-            solution_str = solution_str.split("Assistant:", 1)[1]
-        elif "<|im_start|>assistant" in solution_str:
-            solution_str = solution_str.split("<|im_start|>assistant", 1)[1]
-        else:
-            return None
-        solution_str = solution_str.split("\n")[-1]
-
-        answer_pattern = r"<answer>(.*?)</answer>"
-        match = re.finditer(answer_pattern, solution_str)
-        matches = list(match)
-        if matches:
-            final_answer = matches[-1].group(1).strip()
-        else:
-            final_answer = None
-        return final_answer
-
-    def validate_equation(equation_str, available_numbers):
-        """Validate that equation only uses available numbers and each number once."""
-        try:
-            # Extract all numbers from the equation
-            numbers_in_eq = [int(n) for n in re.findall(r"\d+", equation_str)]
-
-            # Check if all numbers in equation are available
-            available_numbers = sorted(available_numbers)
-            numbers_in_eq = sorted(numbers_in_eq)
-
-            # Each number should be used exactly once
-            return numbers_in_eq == available_numbers
-        except:
-            return False
-
-    def evaluate_equation(equation_str):
-        """Safely evaluate the arithmetic equation using eval() with precautions."""
-        try:
-            # Define a regex pattern that only allows numbers, operators, parentheses, and whitespace
-            allowed_pattern = r"^[\d+\-*/().\s]+$"
-            if not re.match(allowed_pattern, equation_str):
-                raise ValueError("Invalid characters in equation.")
-
-            # Evaluate the equation with restricted globals and locals
-            result = eval(equation_str, {"__builtins__": None}, {})
-            return result
-        except Exception as e:
-            return None
-
-    def compute_score(solution_str, ground_truth, format_score=0.1, score=1.0):
-        """The scoring function for countdown task.
-
-        Args:
-            solution_str: the solution text
-            ground_truth: dictionary containing target number and available numbers
-            method: the method to extract the solution
-            format_score: the score for correct format but wrong answer
-            score: the score for the correct answer
-        """
-        target = ground_truth["target"]
-        numbers = ground_truth["numbers"]
-
-        equation = extract_solution(solution_str=solution_str)
-
-        if equation is None:
-            return 0
-
-        # Validate equation uses correct numbers
-        if not validate_equation(equation, numbers):
-            return format_score
-        # Evaluate equation
-        try:
-            result = evaluate_equation(equation)
-            if result is None:
-                return format_score
-
-            if abs(result - target) < 1e-5:  # Account for floating point precision
-                return score
-            else:
-                return format_score
-        except Exception:
-            return format_score
-
-    def compute_score_wrapper(completions, ground_truth, **kw):
-        outs = [c[0]["content"] if isinstance(c, list) else str(c) for c in completions]
-        # Compute per-sample scores using the new compute_score while preserving logging
-        scores, lengths = [], []
-        for s, gt in zip(outs, ground_truth):
-            gt_dict = gt if isinstance(gt, dict) else {}
-            # Normalize numbers key for compatibility (dataset may use "nums")
-            if (
-                isinstance(gt_dict, dict)
-                and ("numbers" not in gt_dict)
-                and ("nums" in gt_dict)
-            ):
-                try:
-                    tmp = dict(gt_dict)
-                    tmp["numbers"] = (
-                        tmp.get("numbers")
-                        if tmp.get("numbers") is not None
-                        else tmp.get("nums")
-                    )
-                    gt_dict = tmp
-                except Exception:
-                    pass
-            try:
-                sc = float(compute_score(s, gt_dict))
-            except Exception:
-                sc = 0.0
-            scores.append(sc)
-            lengths.append(len(s))
-
-        # log batch stats (keep names stable with prior runs)
-        step_counter["k"] += 1
-        bstep = step_counter["k"]
-        pct_correct = sum(1.0 for sc in scores if sc >= 1.0) / max(1, len(scores))
-        wandb.log(
-            {
-                "metrics/pct_correct_batch": pct_correct,
-                "gen/avg_output_len_chars": sum(lengths) / max(1, len(lengths)),
-                "step": bstep,
-            }
-        )
-
-        # "aha": first time a prompt becomes fully correct (score == 1.0)
-        # b = kw.get("batch", {})
-        # ids = list(b.get("id_", [])) if isinstance(b, dict) else []
-        # aha = 0.0
-        # for pid, sc in zip(ids, scores):
-        #     prior = seen_correct_once.get(pid, False)
-        #     if (sc >= 1.0) and (prior is False):
-        #         aha += 1.0
-        #         seen_correct_once[pid] = True
-        #         if pid not in first_hit_step:
-        #             first_hit_step[pid] = bstep
-        # if len(ids) > 0:
-        #     log_data = {"signals/aha_rate": aha / len(ids), "step": bstep}
-        #     if len(first_hit_step) >= 3:
-        #         log_data["signals/avg_first_hit_step"] = sum(
-        #             first_hit_step.values()
-        #         ) / len(first_hit_step)
-        #     wandb.log(log_data)
-
-        try:
-            table = wandb.Table(
-                columns=["id_", "target", "numbers", "generation", "correct", "length"],
-                rows=[
-                    [
-                        ids[j],
-                        ground_truth[j].get("target"),
-                        ground_truth[j].get("numbers"),
-                        outs[j],
-                        scores[j] >= 1.0,
-                        len(outs[j]),
-                    ]
-                    for j in range(len(outs))
-                ],
-            )
-            wandb.log({"samples/generations": table, "step": bstep})
-        except Exception as e:
-            print(f"Error logging generations: {e}")
-            pass
-
-        return scores
-
-    # def reward_brevity(completions, **kw):
-    #     outs = [c[0]["content"] if isinstance(c, list) else str(c) for c in completions]
-    #     return [-0.001 * max(0, len(s)) for s in outs]
-
-    # --- training args & algo switch ---
-    rprint("[bold green]Loading training args...[/bold green]")
-    epochs = float(train_args.get("epochs", 1.0))
-    per_device_bs = int(train_args.get("batch_size", 2))
-    grad_accum = int(train_args.get("grad_accum", 8))
+    epochs = int(float(train_args.get("epochs", 1)))
+    train_bs = int(train_args.get("batch_size", 64))
+    val_bs = int(train_args.get("val_batch_size", max(1, train_bs)))
     lr = float(train_args.get("lr", 1e-6))
-    logging_steps = 1
-    num_gen = int(train_args.get("num_generations", 4))
-    max_prompt_len = int(train_args.get("max_prompt_len", 512))
-    max_completion_len = int(train_args.get("max_completion_len", 128))
-    loss_type = str(train_args.get("loss_type", "dapo"))  # "dapo" recommended
-    scale_rewards = train_args.get(
-        "scale_rewards", "group"
-    )  # "group"|"batch"|"none"/False
-    beta = float(train_args.get("beta", 0.0))  # set >0.0 to log KL
-    optim = str(train_args.get("optim", "adamw_torch_fused"))
-    num_workers = int(train_args.get("num_workers", 4))
-    group_by_length = bool(train_args.get("group_by_length", True))
-    dataloader_pin_memory = bool(train_args.get("dataloader_pin_memory", True))
-    warmup_ratio = float(train_args.get("warmup_ratio", 0.04))
-    lr_scheduler_type = str(train_args.get("lr_scheduler_type", "cosine"))
-    max_steps = int(train_args.get("max_steps", -1))
+    max_prompt_len = int(train_args.get("max_prompt_len", 256))
+    max_completion_len = int(train_args.get("max_completion_len", 1024))
+    grpo_mini_bsz = int(train_args.get("grpo_mini_batch_size", 64))
+    grpo_micro_bsz = int(train_args.get("grpo_micro_batch_size", 8))
+    log_prob_micro_bsz = int(train_args.get("log_prob_micro_batch_size", 8))
+    rollout_tp = int(train_args.get("tensor_model_parallel_size", 1))
+    gpu_mem_util = float(train_args.get("gpu_memory_utilization", 0.4))
 
-    # Accelerator hints (DDP etc.). For true multi-GPU DDP, launch with accelerate/torchrun.
-    accelerator_config = {
-        # mixed_precision is handled by bf16/fp16 parameters directly on TrainingArguments
-    }
+    cmd = [
+        "python",
+        "-m",
+        "verl.trainer.main_ppo",
+        "algorithm.adv_estimator=grpo",
+        f"data.train_files={train_file}",
+        f"data.val_files={val_file}",
+        f"data.train_batch_size={train_bs}",
+        f"data.max_prompt_length={max_prompt_len}",
+        f"data.max_response_length={max_completion_len}",
+        "data.filter_overlong_prompts=True",
+        "data.truncation=error",
+        f"actor_rollout_ref.model.path={model_name}",
+        f"actor_rollout_ref.actor.optim.lr={lr}",
+        "actor_rollout_ref.model.use_remove_padding=False",
+        f"actor_rollout_ref.actor.ppo_mini_batch_size={grpo_mini_bsz}",
+        f"actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu={grpo_micro_bsz}",
+        "actor_rollout_ref.actor.checkpoint.save_contents='model,optimizer,extra,hf_model'",
+        "actor_rollout_ref.actor.use_kl_loss=True",
+        "actor_rollout_ref.actor.entropy_coeff=0",
+        "actor_rollout_ref.actor.kl_loss_coef=0.001",
+        "actor_rollout_ref.actor.kl_loss_type=low_var_kl",
+        "actor_rollout_ref.model.enable_gradient_checkpointing=True",
+        "actor_rollout_ref.actor.fsdp_config.param_offload=False",
+        "actor_rollout_ref.actor.fsdp_config.optimizer_offload=False",
+        f"actor_rollout_ref.rollout.tensor_model_parallel_size={rollout_tp}",
+        f"actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu={log_prob_micro_bsz}",
+        "actor_rollout_ref.rollout.name=vllm",
+        f"actor_rollout_ref.rollout.gpu_memory_utilization={gpu_mem_util}",
+        "actor_rollout_ref.rollout.n=5",
+        "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16",
+        "actor_rollout_ref.ref.fsdp_config.param_offload=True",
+        "algorithm.use_kl_in_reward=False",
+        "trainer.critic_warmup=0",
+        "trainer.logger=['console', 'wandb']",
+        "trainer.project_name=tinyzero-rl",
+        f"trainer.experiment_name={run_name}",
+        "trainer.n_gpus_per_node=1",
+        "trainer.nnodes=1",
+        "trainer.test_freq=5",
+        f"trainer.default_local_dir={out_dir}",
+        "trainer.resume_mode=auto",
+        f"trainer.save_freq={max(1, epochs)}",
+        f"trainer.total_training_steps={max(1, train_args.get('max_steps', 0))}",
+        f"trainer.total_epochs={epochs}",
+        "actor_rollout_ref.model.dtype=bfloat16",
+        "critic.model.dtype=bfloat16",
+        "actor_rollout_ref.rollout.dtype=bfloat16",
+        "actor_rollout_ref.ref.dtype=bfloat16",
+        "trainer.precision=bfloat16",
+    ]
 
-    trainer = None
-    cfg = GRPOConfig(
-        output_dir=out_dir,
-        logging_dir=tb_dir,
-        run_name=run_name,
-        report_to=["wandb"],
-        num_train_epochs=epochs,
-        per_device_train_batch_size=per_device_bs,
-        gradient_accumulation_steps=grad_accum,
-        learning_rate=lr,
-        logging_steps=logging_steps,
-        remove_unused_columns=False,
-        bf16=torch.cuda.is_available(),
-        fp16=False,
-        max_prompt_length=max_prompt_len,
-        max_completion_length=max_completion_len,
-        num_generations=num_gen,
-        loss_type=loss_type,  # "dapo" or "dr_grpo" etc.
-        scale_rewards=scale_rewards,  # "group"|"batch"|"none"/False
-        beta=beta,  # nonzero -> logs KL
-        mask_truncated_completions=True,  # generally stabilizes training
-        accelerator_config=accelerator_config,
-        optim=optim,
-        dataloader_num_workers=num_workers,
-        group_by_length=group_by_length,
-        dataloader_pin_memory=dataloader_pin_memory,
-        warmup_ratio=warmup_ratio,
-        lr_scheduler_type=lr_scheduler_type,
-        max_steps=max_steps,
-        gradient_checkpointing=True,
-    )
-    trainer = GRPOTrainer(
-        model=base,
-        processing_class=tok,  # tokenizer; left padding required
-        args=cfg,
-        train_dataset=ds,
-        reward_funcs=[compute_score_wrapper],
-        peft_config=lora_cfg,
-    )
-
-    # Train!
-    rprint("[bold green]Training...[/bold green]")
-    trainer.train()
-
-    # save adapter + tokenizer
-    trainer.model.save_pretrained(out_dir)
-    tok.save_pretrained(out_dir)
+    rprint("[bold green]Launching VERL GRPO...[/bold green]")
+    proc = subprocess.run(cmd, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(f"VERL training failed with return code {proc.returncode}")
 
     # tarball artifact
     tar_path = os.path.join(OUT_ROOT, f"{job_id}.tar.gz")
@@ -564,7 +249,7 @@ def run_rl_job(
     manifest = {
         "job_id": job_id,
         "model": model_name,
-        "algo": algo,
+        "algo": "grpo",
         "tb_dir": tb_dir,
         "artifact_dir": out_dir,
         "artifact_tar": tar_path,
@@ -590,7 +275,6 @@ def run_rl_job(
 )
 @modal.asgi_app()
 def web():
-    import os
     from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse, HTMLResponse
     from fastapi.middleware.cors import CORSMiddleware

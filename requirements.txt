@@ -1,8 +1,7 @@
 accelerate
 codetiming
-datasets
+datasets>=4.0.0
 dill
-flash-attn
 hydra-core
 numpy
 pandas
@@ -13,3 +12,4 @@ transformers
 vllm
 wandb
 weave
+verl

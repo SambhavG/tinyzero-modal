@@ -4,7 +4,7 @@ Preprocess dataset for countdown task - given a target number and N numbers, gen
 
 import re
 import os
-from datasets import Dataset, load_dataset
+from datasets import Dataset, load_dataset, Features, Sequence, Value
 from random import randint, seed, choice
 from typing import List, Tuple
 from tqdm import tqdm
@@ -67,7 +67,7 @@ Assistant: Let me solve this step by step.
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--local_dir", default="~/data/countdown")
+    parser.add_argument("--local_dir", default="./data")
     parser.add_argument("--hdfs_dir", default=None)
     parser.add_argument("--num_samples", type=int, default=100000)
     parser.add_argument("--num_operands", type=int, default=6)
@@ -116,8 +116,15 @@ if __name__ == "__main__":
     train_dataset = train_dataset.map(function=make_map_fn("train"), with_indices=True)
     test_dataset = test_dataset.map(function=make_map_fn("test"), with_indices=True)
 
+    # Filter train to top 1/10th
+    train_dataset = train_dataset.select(range(0, len(train_dataset), 10))
+
     local_dir = args.local_dir
     hdfs_dir = args.hdfs_dir
+
+    # Ensure destination directory exists
+    local_dir = os.path.expanduser(local_dir)
+    os.makedirs(local_dir, exist_ok=True)
 
     train_dataset.to_parquet(os.path.join(local_dir, "train.parquet"))
     test_dataset.to_parquet(os.path.join(local_dir, "test.parquet"))
