@@ -117,11 +117,9 @@ def run_rl_job(
     """
     Launched by the API server; performs RL via VERL (GRPO) and writes:
       - Weights & Biases logging to project "tinyzero-rl" with run "tinyzero-<job_id>"
-      - Console logs captured under /outputs/artifacts/<job_id>/verl_demo.log
       - Tarball of artifacts under /outputs/artifacts/<job_id>.tar.gz
     """
     import subprocess
-    import wandb
 
     os.makedirs(OUT_ROOT, exist_ok=True)
 
@@ -131,20 +129,14 @@ def run_rl_job(
     tb_dir = os.path.join(out_dir, "tb")
     os.makedirs(tb_dir, exist_ok=True)
 
-    # Initialize wandb
+    # Ensure Weights & Biases env for VERL (VERL initializes W&B internally)
     wandb_api_key = os.getenv("WANDB_API_KEY")
-    if wandb_api_key:
-        wandb.login(key=wandb_api_key)
-    else:
+    if not wandb_api_key:
         raise ValueError("WANDB_API_KEY not found in environment variables")
-
-    wandb_entity = os.getenv("WANDB_ENTITY", "sambhavg")  # fallback to default
-    wandb.init(
-        entity=wandb_entity,
-        project="tinyzero-rl",
-        name=run_name,
-        config={"job_id": job_id, "model_name": model_name, "algo": algo, **train_args},
-    )
+    # Propagate explicit entity/project/name so VERL's wandb.init uses correct workspace
+    os.environ["WANDB_ENTITY"] = os.getenv("WANDB_ENTITY") or "sambhavg"
+    os.environ.setdefault("WANDB_PROJECT", "tinyzero-rl")
+    os.environ["WANDB_NAME"] = run_name
 
     # --- dataset visibility from Modal volume mount at /data ---
     try:
@@ -226,24 +218,20 @@ def run_rl_job(
         f"trainer.save_freq={max(1, epochs)}",
         f"trainer.total_training_steps={max(1, train_args.get('max_steps', 0))}",
         f"trainer.total_epochs={epochs}",
-        "actor_rollout_ref.model.dtype=bfloat16",
-        "critic.model.dtype=bfloat16",
+        # "actor_rollout_ref.model.dtype=bfloat16",
+        # "critic.model.dtype=bfloat16",
         "actor_rollout_ref.rollout.dtype=bfloat16",
-        "actor_rollout_ref.ref.dtype=bfloat16",
-        "trainer.precision=bfloat16",
+        # "actor_rollout_ref.ref.dtype=bfloat16",
+        # "trainer.precision=bfloat16",
     ]
 
     rprint("[bold green]Launching VERL GRPO...[/bold green]")
     proc = subprocess.run(cmd, check=False)
-    if proc.returncode != 0:
-        raise RuntimeError(f"VERL training failed with return code {proc.returncode}")
 
     # tarball artifact
     tar_path = os.path.join(OUT_ROOT, f"{job_id}.tar.gz")
     with tarfile.open(tar_path, "w:gz") as tar:
         tar.add(out_dir, arcname=os.path.basename(out_dir))
-
-    wandb.finish()
 
     # record manifest
     manifest = {
@@ -253,6 +241,8 @@ def run_rl_job(
         "tb_dir": tb_dir,
         "artifact_dir": out_dir,
         "artifact_tar": tar_path,
+        "status": "ok" if proc.returncode == 0 else "error",
+        "return_code": proc.returncode,
         "time_finished": _now(),
     }
     with open(os.path.join(out_dir, "manifest.json"), "w") as f:

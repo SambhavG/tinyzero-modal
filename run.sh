@@ -1,7 +1,7 @@
 curl -X POST "https://sambhavg-modal-workspace--tinyzero-rl-web.modal.run/v1/rl/train" \
   -H "content-type: application/json" \
   -d '{
-  "parquet_glob": "/data/data/*.parquet",
+  "parquet_glob": "/data/*.parquet",
   "algo": "grpo",
   "train_args": {
     "epochs": 1,
