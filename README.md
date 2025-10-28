@@ -1,5 +1,6 @@
 modal deploy tinyzero_modal.py && ./run.sh
 
+modal deploy grpo_verl_tinyzero.py && modal run --detach grpo_verl_tinyzero.py::train             
 
 ### regenerate data
 python countdown_dataset.py

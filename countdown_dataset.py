@@ -76,7 +76,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_number", type=int, default=100)
     parser.add_argument("--train_size", type=int, default=327680)
     parser.add_argument("--test_size", type=int, default=1024)
-    parser.add_argument("--template_type", type=str, default="base")
+    parser.add_argument("--template_type", type=str, default="qwen-instruct")
 
     args = parser.parse_args()
 
